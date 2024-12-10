@@ -12,6 +12,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v3
@@ -29,14 +31,21 @@ jobs:
       - name: Run indexer
         run: node ./src/indexer.js
 
-      - name: Pull latest changes
+      - name: Stash changes (if any)
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git pull --rebase origin main
+          git add -A
+          git stash --include-untracked || echo "No changes to stash"
 
-      - name: Commit and push if changes
+      - name: Pull latest changes
+        run: git pull --rebase origin main
+
+      - name: Apply stashed changes (if any)
+        run: git stash pop || echo "No stashed changes to apply"
+
+      - name: Commit and push data
         run: |
           git add data/
-          git diff-index --quiet HEAD || git commit -m "Update blockchain indexer data"
-          git push
+          git commit -m "Update blockchain indexer data" || echo "No changes to commit"
+          git push origin main
