@@ -36,10 +36,3 @@ jobs:
           git add -A
           git diff-index --quiet HEAD || git commit -m "Update blockchain indexer data"
           git push
-
-      - name: Upload error log if present
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: error-log
-          path: ./error_log.txt
