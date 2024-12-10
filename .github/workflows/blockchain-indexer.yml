@@ -29,10 +29,14 @@ jobs:
       - name: Run indexer
         run: node ./src/indexer.js
 
-      - name: Commit and push if changes
+      - name: Pull latest changes
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add -A
+          git pull --rebase origin main
+
+      - name: Commit and push if changes
+        run: |
+          git add data/
           git diff-index --quiet HEAD || git commit -m "Update blockchain indexer data"
           git push
