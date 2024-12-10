@@ -1,21 +1,35 @@
 import fs from "fs";
 import path from "path";
 import { createPublicClient, http, parseAbiItem } from "viem";
-import { mainnet, polygon } from "viem/chains";
+import { mainnet } from "viem/chains";
 
 // Configuration
 const NETWORKS = [
   {
     name: "ethereum",
-    client: createPublicClient({ chain: mainnet, transport: http() }),
+    rpcs: [
+      "https://eth-mainnet.g.alchemy.com/v2/K4l0nBr5UE4e8Kkr9oETClKtKcW9DJYT",
+      "https://cosmological-blissful-research.quiknode.pro/223e82a51a5bd046eb64dea56744b813038d2495",
+      "https://mainnet.infura.io/v3/273aad656cd94f9aa022e4899b87dd6c",
+      "https://eth-mainnet.g.alchemy.com/v2/OwAiuhcEzUbycbvve7flzDzAb39nyYA-",
+      "https://eth-mainnet.g.alchemy.com/v2/2SAHh1Jw8BIHHI9NT3Z1qYfT8HcSo9b5",
+      "https://ethereum-mainnet.core.chainstack.com/fe2d2bc46bdaf3716bcb64bd9351e01b",
+    ],
     chainId: 1,
-    fromBlock: 21368974n, // Starting block for Ethereum if tracking starts fresh
+    fromBlock: 21368974n,
   },
   {
     name: "polygon",
-    client: createPublicClient({ chain: polygon, transport: http() }),
+    rpcs: [
+      "https://polygon-mainnet.g.alchemy.com/v2/sTJtjdOBExGkT4lWuS-wt5VduGCQsqwf",
+      "https://snowy-polished-daylight.matic.quiknode.pro/466e77c6325e477c76712cb478e6cd09ce1cc7a2",
+      "https://polygon-mainnet.infura.io/v3/273aad656cd94f9aa022e4899b87dd6c",
+      "https://polygon-mainnet.g.alchemy.com/v2/-CukmxMwnzkgtKbWDIqvJ5Oi8uvdxUlg",
+      "https://polygon-mainnet.g.alchemy.com/v2/NG4jyJ0QEr410TuliKgmZIYjwN5y2eyL",
+      "https://polygon-mainnet.core.chainstack.com/275d1e0ae21da1e6aa7a21e9962e4ca5",
+    ],
     chainId: 137,
-    fromBlock: 65293772n, // Starting block for Polygon if tracking starts fresh
+    fromBlock: 65293772n,
   },
 ];
 const ABI_EVENTS = [
@@ -29,9 +43,33 @@ const ABI_EVENTS = [
 const DATA_DIR = "./data";
 const MAX_BLOCK_RANGE = 800; // Maximum block range allowed per request
 
-// Helpers
+// Helper Functions
 const ensureDirExists = (dir) => {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+};
+
+const stringifyWithBigInt = (data) =>
+  JSON.stringify(
+    data,
+    (key, value) => (typeof value === "bigint" ? value.toString() : value),
+    2
+  );
+
+const parseWithBigInt = (data) =>
+  JSON.parse(data, (key, value) =>
+    /^\d+$/.test(value) ? BigInt(value) : value
+  );
+
+const saveTrackerFile = (filepath, data) => {
+  fs.writeFileSync(filepath, stringifyWithBigInt(data));
+};
+
+const loadTrackerFile = (filepath) => {
+  try {
+    return parseWithBigInt(fs.readFileSync(filepath, "utf8"));
+  } catch {
+    return {};
+  }
 };
 
 const loadJsonFile = (filepath) => {
@@ -46,28 +84,6 @@ const saveJsonFile = (filepath, data) => {
   fs.writeFileSync(filepath, JSON.stringify(data, null, 2));
 };
 
-const loadTrackerFile = (filepath) => {
-  try {
-    return parseWithBigInt(fs.readFileSync(filepath, "utf8"));
-  } catch {
-    return {};
-  }
-};
-
-const saveTrackerFile = (filepath, data) => {
-  fs.writeFileSync(filepath, stringifyWithBigInt(data));
-};
-
-const stringifyWithBigInt = (data) =>
-  JSON.stringify(
-    data,
-    (_, value) => (typeof value === "bigint" ? value.toString() : value),
-    2
-  );
-
-const parseWithBigInt = (data) =>
-  JSON.parse(data, (_, value) => (/^\d+$/.test(value) ? BigInt(value) : value));
-
 const splitBlockRanges = (fromBlock, toBlock, maxRange) => {
   const ranges = [];
   let start = fromBlock;
@@ -77,6 +93,46 @@ const splitBlockRanges = (fromBlock, toBlock, maxRange) => {
     start = end + 1n;
   }
   return ranges;
+};
+
+const createRpcClient = (rpcs) => {
+  let currentIndex = 0;
+
+  return {
+    getNextRpc: () => {
+      const rpc = rpcs[currentIndex];
+      currentIndex = (currentIndex + 1) % rpcs.length;
+      return rpc;
+    },
+    createClient: (rpc) =>
+      createPublicClient({ chain: mainnet, transport: http(rpc) }),
+  };
+};
+
+const fetchWithRetries = async (
+  fetchFn,
+  rpcManager,
+  maxRetries = 5,
+  delay = 1000
+) => {
+  let attempts = 0;
+  while (attempts < maxRetries) {
+    try {
+      return await fetchFn();
+    } catch (error) {
+      if (error.status === 429) {
+        attempts++;
+        const newRpc = rpcManager.getNextRpc();
+        console.log(`Rate limit hit. Switching to next RPC: ${newRpc}`);
+        rpcManager.client = rpcManager.createClient(newRpc);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        delay *= 2; // Exponential backoff
+      } else {
+        throw error;
+      }
+    }
+  }
+  throw new Error("Exceeded maximum retries across all RPCs.");
 };
 
 const fetchLogsInRange = async (client, event, fromBlock, toBlock) => {
@@ -131,13 +187,11 @@ const mergeEvents = (existingData, newEvents) => {
   const now = new Date();
   const today = now.toISOString().split("T")[0];
 
-  for (const {
-    name,
-    client,
-    chainId,
-    fromBlock: defaultFromBlock,
-  } of NETWORKS) {
-    console.log(`------------ Processing chain: ${name} ------------`);
+  for (const { name, rpcs, chainId, fromBlock: defaultFromBlock } of NETWORKS) {
+    console.log(`\n\n------------ Processing chain: ${name} ------------`);
+
+    const rpcManager = createRpcClient(rpcs);
+    rpcManager.client = rpcManager.createClient(rpcManager.getNextRpc());
 
     const networkDir = path.join(DATA_DIR, name);
     const blockRangesFile = path.join(networkDir, "block_ranges.json");
@@ -148,24 +202,24 @@ const mergeEvents = (existingData, newEvents) => {
     const lastBlocks = loadTrackerFile(lastBlocksFile);
     const blockRanges = loadTrackerFile(blockRangesFile);
 
-    // Use defaultFromBlock if no tracking data exists
     const fromBlock = BigInt(lastBlocks[name]?.fromBlock || defaultFromBlock);
-    const latestBlock = await client.getBlockNumber();
+    const latestBlock = await fetchWithRetries(
+      () => rpcManager.client.getBlockNumber(),
+      rpcManager
+    );
     const toBlock = latestBlock;
 
     console.log(`Fetching logs from block ${fromBlock} to ${toBlock}...`);
 
-    const requestedLogs = await fetchLogsInRange(
-      client,
-      ABI_EVENTS[0],
-      fromBlock,
-      toBlock
+    const requestedLogs = await fetchWithRetries(
+      () =>
+        fetchLogsInRange(rpcManager.client, ABI_EVENTS[0], fromBlock, toBlock),
+      rpcManager
     );
-    const respondedLogs = await fetchLogsInRange(
-      client,
-      ABI_EVENTS[1],
-      fromBlock,
-      toBlock
+    const respondedLogs = await fetchWithRetries(
+      () =>
+        fetchLogsInRange(rpcManager.client, ABI_EVENTS[1], fromBlock, toBlock),
+      rpcManager
     );
 
     console.log(`Fetched ${requestedLogs.length} BlockHeaderRequested logs`);
@@ -217,20 +271,20 @@ const mergeEvents = (existingData, newEvents) => {
     // Update block range tracker
     if (!blockRanges[today]) {
       blockRanges[today] = {
-        startBlock: fromBlock.toString(), // Store as string for consistency
-        endBlock: toBlock.toString(), // Store as string for consistency
+        startBlock: fromBlock.toString(),
+        endBlock: toBlock.toString(),
       };
     } else {
-      blockRanges[today].endBlock = toBlock.toString(); // Store as string
+      blockRanges[today].endBlock = toBlock.toString();
     }
 
     console.log(`Updating block ranges: ${fromBlock} - ${toBlock}`);
     saveTrackerFile(blockRangesFile, blockRanges);
 
-    lastBlocks[name] = { fromBlock: (toBlock + 1n).toString() }; // Store as string
+    lastBlocks[name] = { fromBlock: (toBlock + 1n).toString() };
     console.log(`Updating last processed block to ${toBlock + 1n}`);
     saveTrackerFile(lastBlocksFile, lastBlocks);
 
-    console.log(`-------- Finished processing chain: ${name} -------\n`);
+    console.log(`Finished processing chain: ${name}`);
   }
 })();
