@@ -1,6 +1,6 @@
 import fs from "fs";
 import path from "path";
-import { createPublicClient, http, parseAbiItem } from "viem";
+import { createPublicClient, http, parseAbi } from "viem";
 import { mainnet } from "viem/chains";
 
 // Configuration
@@ -33,19 +33,12 @@ const NETWORKS = [
   },
 ];
 
-// Parse ABI for events
-const ABI_EVENTS = [
-  parseAbiItem(
-    `event BlockHeaderRequested(address indexed contractAddress, uint256 indexed blockNumber, uint256 indexed headerIndex, uint256 feeAmount)`
-  ),
-  parseAbiItem(
-    `event BlockHeaderResponded(address indexed responder, uint256 indexed blockNumber, uint256 indexed headerIndex)`
-  ),
-  parseAbiItem(`event BlockHeaderCommitted(uint256 indexed blockNumber)`),
-  parseAbiItem(
-    `event BlockHeaderRefunded(uint256 indexed blockNumber, uint256 indexed headerIndex)`
-  ),
-];
+const ABI = parseAbi([
+  "event BlockHeaderRequested(address indexed contractAddress, uint256 indexed blockNumber, uint256 indexed headerIndex, uint256 feeAmount)",
+  "event BlockHeaderResponded(address indexed responder, uint256 indexed blockNumber, uint256 indexed headerIndex)",
+  "event BlockHeaderCommitted(uint256 indexed blockNumber)",
+  "event BlockHeaderRefunded(uint256 indexed blockNumber, uint256 indexed headerIndex)",
+]);
 
 const DATA_DIR = "./data";
 const MAX_BLOCK_RANGE = 800; // Maximum block range allowed per request
@@ -142,12 +135,12 @@ const fetchWithRetries = async (
   throw new Error("Exceeded maximum retries across all RPCs.");
 };
 
-const fetchLogsInRange = async (client, event, fromBlock, toBlock) => {
+const fetchLogsInRange = async (client, fromBlock, toBlock, events) => {
   const ranges = splitBlockRanges(fromBlock, toBlock, MAX_BLOCK_RANGE);
   const logs = [];
   for (const range of ranges) {
     const rangeLogs = await client.getLogs({
-      event,
+      events,
       fromBlock: range.fromBlock,
       toBlock: range.toBlock,
     });
@@ -156,10 +149,15 @@ const fetchLogsInRange = async (client, event, fromBlock, toBlock) => {
   return logs;
 };
 
+/**
+ * Merge events:
+ * Keys:
+ * - BlockHeaderRequested, BlockHeaderResponded, BlockHeaderRefunded share key: blockNumber-headerIndex
+ * - BlockHeaderCommitted uses key: blockNumber-committed
+ *
+ * When merging, we ensure no duplicates. If a monthly or daily file updates, we re-merge.
+ */
 const mergeEvents = (existingData, newEvents) => {
-  // We'll map events by a composite key depending on event type:
-  // For requested/responded/refunded: key = `${blockNumber}-${headerIndex}`
-  // For committed: key = `${blockNumber}-committed`
   const eventMap = new Map();
 
   // Put existing data into the map
@@ -167,17 +165,15 @@ const mergeEvents = (existingData, newEvents) => {
     let key;
     if (evt.headerIndex !== null && evt.headerIndex !== undefined) {
       key = `${evt.blockNumber}-${evt.headerIndex}`;
-    } else if (evt.committedBlockNumber !== null) {
-      // This entry might have come from a commit-only event.
+    } else if (evt.committedBlockNumber) {
       key = `${evt.blockNumber}-committed`;
     } else {
-      // If no headerIndex and not a commit event, treat as committed-type key
+      // If no headerIndex and no commit info, treat as commit-type key
       key = `${evt.blockNumber}-committed`;
     }
     eventMap.set(key, evt);
   }
 
-  // Function to update or create events in the map
   const updateEventMap = (event) => {
     let key;
     if (
@@ -187,8 +183,6 @@ const mergeEvents = (existingData, newEvents) => {
     ) {
       key = `${event.blockNumber}-${event.headerIndex}`;
     } else if (event.type === "committed") {
-      // For committed events, we might need to update all events with the same blockNumber
-      // or create a new one if none exist
       key = `${event.blockNumber}-committed`;
     }
 
@@ -205,98 +199,45 @@ const mergeEvents = (existingData, newEvents) => {
           existing.updatedAt = new Date().toISOString();
         }
       } else if (event.type === "committed") {
-        // Add commit info to the existing event
         existing.committedBlockNumber = event.committedBlockNumber;
         existing.committedTransactionHash = event.committedTransactionHash;
         existing.committedBlockHash = event.committedBlockHash;
         existing.updatedAt = new Date().toISOString();
       } else if (event.type === "refunded") {
-        // Add refund info to the existing event
         existing.refundedBlockNumber = event.refundedBlockNumber;
         existing.refundedTransactionHash = event.refundedTransactionHash;
         existing.refundedBlockHash = event.refundedBlockHash;
         existing.updatedAt = new Date().toISOString();
-      } else if (event.type === "requested") {
-        // If requested event for same key, just ensure fields are correct
-        // Typically requested events won't overwrite anything since they're the initial record
       }
+      // requested events usually come first, so no special merge needed unless data is missing
     } else {
-      // No existing entry
-      // For committed events, we need to apply commit info to all events with the same blockNumber if they exist
-      // If none exists for that blockNumber, create a new "commit-only" entry
-      if (event.type === "committed") {
-        // Check if there are entries with the same blockNumber but different headerIndex
-        let found = false;
-        for (const [k, v] of eventMap.entries()) {
-          const parts = k.split("-");
-          const bn = parts[0];
-          if (bn === event.blockNumber.toString() && parts[1] !== "committed") {
-            // Update these events with commit info
-            v.committedBlockNumber = event.committedBlockNumber;
-            v.committedTransactionHash = event.committedTransactionHash;
-            v.committedBlockHash = event.committedBlockHash;
-            v.updatedAt = new Date().toISOString();
-            found = true;
-          }
-        }
-
-        if (!found) {
-          // Create a new commit-only entry
-          eventMap.set(key, {
-            chainId: event.chainId,
-            contractAddress: null,
-            responder: null,
-            blockNumber: event.blockNumber,
-            headerIndex: null,
-            feeAmount: null,
-            requestedBlockNumber: null,
-            requestedTransactionHash: null,
-            requestedBlockHash: null,
-            respondedBlockNumber: null,
-            respondedTransactionHash: null,
-            respondedBlockHash: null,
-            committedBlockNumber: event.committedBlockNumber,
-            committedTransactionHash: event.committedTransactionHash,
-            committedBlockHash: event.committedBlockHash,
-            refundedBlockNumber: null,
-            refundedTransactionHash: null,
-            refundedBlockHash: null,
-            createdAt: event.createdAt,
-            updatedAt: event.updatedAt,
-          });
-        }
-      } else {
-        // For requested, responded, refunded:
-        // If it's responded or refunded without a requested event, create a skeleton entry
-        const newEntry = {
-          chainId: event.chainId,
-          contractAddress: event.contractAddress || null,
-          responder: event.responder || null,
-          blockNumber: event.blockNumber,
-          headerIndex:
-            event.headerIndex !== undefined ? event.headerIndex : null,
-          feeAmount: event.feeAmount || null,
-          requestedBlockNumber: event.requestedBlockNumber || null,
-          requestedTransactionHash: event.requestedTransactionHash || null,
-          requestedBlockHash: event.requestedBlockHash || null,
-          respondedBlockNumber: event.respondedBlockNumber || null,
-          respondedTransactionHash: event.respondedTransactionHash || null,
-          respondedBlockHash: event.respondedBlockHash || null,
-          committedBlockNumber: null,
-          committedTransactionHash: null,
-          committedBlockHash: null,
-          refundedBlockNumber: event.refundedBlockNumber || null,
-          refundedTransactionHash: event.refundedTransactionHash || null,
-          refundedBlockHash: event.refundedBlockHash || null,
-          createdAt: event.createdAt || new Date().toISOString(),
-          updatedAt: event.updatedAt || new Date().toISOString(),
-        };
-        eventMap.set(key, newEntry);
-      }
+      // create a new entry
+      const newEntry = {
+        chainId: event.chainId,
+        contractAddress: event.contractAddress || null,
+        responder: event.responder || null,
+        blockNumber: event.blockNumber,
+        headerIndex: event.headerIndex !== undefined ? event.headerIndex : null,
+        feeAmount: event.feeAmount || null,
+        requestedBlockNumber: event.requestedBlockNumber || null,
+        requestedTransactionHash: event.requestedTransactionHash || null,
+        requestedBlockHash: event.requestedBlockHash || null,
+        respondedBlockNumber: event.respondedBlockNumber || null,
+        respondedTransactionHash: event.respondedTransactionHash || null,
+        respondedBlockHash: event.respondedBlockHash || null,
+        committedBlockNumber: event.committedBlockNumber || null,
+        committedTransactionHash: event.committedTransactionHash || null,
+        committedBlockHash: event.committedBlockHash || null,
+        refundedBlockNumber: event.refundedBlockNumber || null,
+        refundedTransactionHash: event.refundedTransactionHash || null,
+        refundedBlockHash: event.refundedBlockHash || null,
+        createdAt: event.createdAt || new Date().toISOString(),
+        updatedAt: event.updatedAt || new Date().toISOString(),
+      };
+      eventMap.set(key, newEntry);
     }
   };
 
-  // Add or update with new events
   for (const event of newEvents) {
     updateEventMap(event);
   }
@@ -304,33 +245,33 @@ const mergeEvents = (existingData, newEvents) => {
   return Array.from(eventMap.values());
 };
 
-const createBaseEventObject = (chainId, blockNumber, headerIndex = null) => ({
-  chainId,
-  contractAddress: null,
-  responder: null,
-  blockNumber,
-  headerIndex,
-  feeAmount: null,
-  requestedBlockNumber: null,
-  requestedTransactionHash: null,
-  requestedBlockHash: null,
-  respondedBlockNumber: null,
-  respondedTransactionHash: null,
-  respondedBlockHash: null,
-  committedBlockNumber: null,
-  committedTransactionHash: null,
-  committedBlockHash: null,
-  refundedBlockNumber: null,
-  refundedTransactionHash: null,
-  refundedBlockHash: null,
-  createdAt: new Date().toISOString(),
-  updatedAt: new Date().toISOString(),
-});
+// Helper to rebuild monthly file
+const rebuildMonthlyFile = (networkDir, yearMonth) => {
+  const [year, month] = yearMonth.split("-");
+  // Get all daily files for this month (YYYY-MM-DD.json)
+  const files = fs
+    .readdirSync(networkDir)
+    .filter(
+      (f) => f.startsWith(yearMonth) && f.endsWith(".json") && f.length === 15
+    ); // format YYYY-MM-DD.json length check
 
-// Main Function
+  let allEvents = [];
+  for (const file of files) {
+    const dailyData = loadJsonFile(path.join(networkDir, file));
+    allEvents = mergeEvents(allEvents, dailyData);
+  }
+
+  const monthlyFilePath = path.join(networkDir, `${yearMonth}.json`);
+  saveJsonFile(monthlyFilePath, allEvents);
+  console.log(
+    `Rebuilt monthly file: ${yearMonth}.json with ${allEvents.length} events`
+  );
+};
+
 (async () => {
   const now = new Date();
   const today = now.toISOString().split("T")[0];
+  const thisYearMonth = today.slice(0, 7); // YYYY-MM
 
   for (const { name, rpcs, chainId, fromBlock: defaultFromBlock } of NETWORKS) {
     console.log(`\n\n------------ Processing chain: ${name} ------------`);
@@ -339,10 +280,10 @@ const createBaseEventObject = (chainId, blockNumber, headerIndex = null) => ({
     rpcManager.client = rpcManager.createClient(rpcManager.getNextRpc());
 
     const networkDir = path.join(DATA_DIR, name);
+    ensureDirExists(networkDir);
+
     const blockRangesFile = path.join(networkDir, "block_ranges.json");
     const lastBlocksFile = path.join(DATA_DIR, "last_blocks.json");
-
-    ensureDirExists(networkDir);
 
     const lastBlocks = loadTrackerFile(lastBlocksFile);
     const blockRanges = loadTrackerFile(blockRangesFile);
@@ -356,128 +297,148 @@ const createBaseEventObject = (chainId, blockNumber, headerIndex = null) => ({
 
     console.log(`Fetching logs from block ${fromBlock} to ${toBlock}...`);
 
-    // Fetch all events
-    const requestedLogs = await fetchWithRetries(
-      () =>
-        fetchLogsInRange(rpcManager.client, ABI_EVENTS[0], fromBlock, toBlock),
-      rpcManager
-    );
-    const respondedLogs = await fetchWithRetries(
-      () =>
-        fetchLogsInRange(rpcManager.client, ABI_EVENTS[1], fromBlock, toBlock),
-      rpcManager
-    );
-    const committedLogs = await fetchWithRetries(
-      () =>
-        fetchLogsInRange(rpcManager.client, ABI_EVENTS[2], fromBlock, toBlock),
-      rpcManager
-    );
-    const refundedLogs = await fetchWithRetries(
-      () =>
-        fetchLogsInRange(rpcManager.client, ABI_EVENTS[3], fromBlock, toBlock),
+    // Fetch all events in a single query using combined ABI
+    const logs = await fetchWithRetries(
+      () => fetchLogsInRange(rpcManager.client, fromBlock, toBlock, ABI),
       rpcManager
     );
 
-    console.log(`Fetched ${requestedLogs.length} BlockHeaderRequested logs`);
-    console.log(`Fetched ${respondedLogs.length} BlockHeaderResponded logs`);
-    console.log(`Fetched ${committedLogs.length} BlockHeaderCommitted logs`);
-    console.log(`Fetched ${refundedLogs.length} BlockHeaderRefunded logs`);
+    console.log(`Fetched ${logs.length} total logs.`);
 
-    const requestedEvents = requestedLogs.map((log) => ({
-      type: "requested",
-      chainId,
-      contractAddress: log.args[0],
-      responder: null,
-      blockNumber: log.args[1],
-      headerIndex: log.args[2],
-      feeAmount: log.args[3],
-      requestedBlockNumber: log.blockNumber,
-      requestedTransactionHash: log.transactionHash,
-      requestedBlockHash: log.blockHash,
-      respondedBlockNumber: null,
-      respondedTransactionHash: null,
-      respondedBlockHash: null,
-      committedBlockNumber: null,
-      committedTransactionHash: null,
-      committedBlockHash: null,
-      refundedBlockNumber: null,
-      refundedTransactionHash: null,
-      refundedBlockHash: null,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    }));
+    // If needed, fallback decoding (usually not needed as viem decodes them):
+    // const { parseLog } = await import('viem');
+    // For logs missing args (uncommon):
+    // for (const log of logs) {
+    //   if (!log.args) {
+    //     try {
+    //       const decoded = parseLog({ abi: ABI, data: log.data, topics: log.topics });
+    //       log.eventName = decoded.eventName;
+    //       log.args = decoded.args;
+    //     } catch (e) {
+    //       console.warn('Failed to decode log:', e);
+    //     }
+    //   }
+    // }
 
-    const respondedEvents = respondedLogs.map((log) => ({
-      type: "responded",
-      chainId,
-      contractAddress: null,
-      responder: log.args[0],
-      blockNumber: log.args[1],
-      headerIndex: log.args[2],
-      feeAmount: null,
-      requestedBlockNumber: null,
-      requestedTransactionHash: null,
-      requestedBlockHash: null,
-      respondedBlockNumber: log.blockNumber,
-      respondedTransactionHash: log.transactionHash,
-      respondedBlockHash: log.blockHash,
-      committedBlockNumber: null,
-      committedTransactionHash: null,
-      committedBlockHash: null,
-      refundedBlockNumber: null,
-      refundedTransactionHash: null,
-      refundedBlockHash: null,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    }));
+    const requestedEvents = [];
+    const respondedEvents = [];
+    const committedEvents = [];
+    const refundedEvents = [];
 
-    const committedEvents = committedLogs.map((log) => ({
-      type: "committed",
-      chainId,
-      contractAddress: null,
-      responder: null,
-      blockNumber: log.args[0],
-      headerIndex: null,
-      feeAmount: null,
-      requestedBlockNumber: null,
-      requestedTransactionHash: null,
-      requestedBlockHash: null,
-      respondedBlockNumber: null,
-      respondedTransactionHash: null,
-      respondedBlockHash: null,
-      committedBlockNumber: log.blockNumber,
-      committedTransactionHash: log.transactionHash,
-      committedBlockHash: log.blockHash,
-      refundedBlockNumber: null,
-      refundedTransactionHash: null,
-      refundedBlockHash: null,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    }));
+    // Categorize logs by eventName
+    for (const log of logs) {
+      const { eventName, args } = log;
+      if (!eventName || !args) {
+        // If eventName or args missing, skip this log
+        continue;
+      }
 
-    const refundedEvents = refundedLogs.map((log) => ({
-      type: "refunded",
-      chainId,
-      contractAddress: null,
-      responder: null,
-      blockNumber: log.args[0],
-      headerIndex: log.args[1],
-      feeAmount: null,
-      requestedBlockNumber: null,
-      requestedTransactionHash: null,
-      requestedBlockHash: null,
-      respondedBlockNumber: null,
-      respondedTransactionHash: null,
-      respondedBlockHash: null,
-      committedBlockNumber: null,
-      committedTransactionHash: null,
-      committedBlockHash: null,
-      refundedBlockNumber: log.blockNumber,
-      refundedTransactionHash: log.transactionHash,
-      refundedBlockHash: log.blockHash,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    }));
+      // Convert block numbers and indexes to strings if needed
+      // Actually, we keep BigInt for blockNumber internally, just convert before saving if needed.
+      // Our final JSON uses strings anyway.
+      const blockNumber = args.blockNumber ? args.blockNumber : null;
+      const headerIndex =
+        args.headerIndex !== undefined ? args.headerIndex : null;
+
+      if (eventName === "BlockHeaderRequested") {
+        requestedEvents.push({
+          type: "requested",
+          chainId,
+          contractAddress: args.contractAddress,
+          responder: null,
+          blockNumber: blockNumber,
+          headerIndex: headerIndex,
+          feeAmount: args.feeAmount,
+          requestedBlockNumber: log.blockNumber,
+          requestedTransactionHash: log.transactionHash,
+          requestedBlockHash: log.blockHash,
+          respondedBlockNumber: null,
+          respondedTransactionHash: null,
+          respondedBlockHash: null,
+          committedBlockNumber: null,
+          committedTransactionHash: null,
+          committedBlockHash: null,
+          refundedBlockNumber: null,
+          refundedTransactionHash: null,
+          refundedBlockHash: null,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+      } else if (eventName === "BlockHeaderResponded") {
+        respondedEvents.push({
+          type: "responded",
+          chainId,
+          contractAddress: null,
+          responder: args.responder,
+          blockNumber: blockNumber,
+          headerIndex: headerIndex,
+          feeAmount: null,
+          requestedBlockNumber: null,
+          requestedTransactionHash: null,
+          requestedBlockHash: null,
+          respondedBlockNumber: log.blockNumber,
+          respondedTransactionHash: log.transactionHash,
+          respondedBlockHash: log.blockHash,
+          committedBlockNumber: null,
+          committedTransactionHash: null,
+          committedBlockHash: null,
+          refundedBlockNumber: null,
+          refundedTransactionHash: null,
+          refundedBlockHash: null,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+      } else if (eventName === "BlockHeaderCommitted") {
+        // no headerIndex here
+        committedEvents.push({
+          type: "committed",
+          chainId,
+          contractAddress: null,
+          responder: null,
+          blockNumber: blockNumber,
+          headerIndex: null,
+          feeAmount: null,
+          requestedBlockNumber: null,
+          requestedTransactionHash: null,
+          requestedBlockHash: null,
+          respondedBlockNumber: null,
+          respondedTransactionHash: null,
+          respondedBlockHash: null,
+          committedBlockNumber: log.blockNumber,
+          committedTransactionHash: log.transactionHash,
+          committedBlockHash: log.blockHash,
+          refundedBlockNumber: null,
+          refundedTransactionHash: null,
+          refundedBlockHash: null,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+      } else if (eventName === "BlockHeaderRefunded") {
+        refundedEvents.push({
+          type: "refunded",
+          chainId,
+          contractAddress: null,
+          responder: null,
+          blockNumber: blockNumber,
+          headerIndex: headerIndex,
+          feeAmount: null,
+          requestedBlockNumber: null,
+          requestedTransactionHash: null,
+          requestedBlockHash: null,
+          respondedBlockNumber: null,
+          respondedTransactionHash: null,
+          respondedBlockHash: null,
+          committedBlockNumber: null,
+          committedTransactionHash: null,
+          committedBlockHash: null,
+          refundedBlockNumber: log.blockNumber,
+          refundedTransactionHash: log.transactionHash,
+          refundedBlockHash: log.blockHash,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    }
 
     const allEvents = [
       ...requestedEvents,
@@ -509,6 +470,9 @@ const createBaseEventObject = (chainId, blockNumber, headerIndex = null) => ({
     lastBlocks[name] = { fromBlock: (toBlock + 1n).toString() };
     console.log(`Updating last processed block to ${toBlock + 1n}`);
     saveTrackerFile(lastBlocksFile, lastBlocks);
+
+    // Rebuild monthly file
+    rebuildMonthlyFile(networkDir, thisYearMonth);
 
     console.log(`Finished processing chain: ${name}`);
   }

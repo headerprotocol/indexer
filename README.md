@@ -1,107 +1,80 @@
-# HeaderProtocol Indexer
+# HeaderProtocol: Event Indexer Service
 
-The **HeaderProtocol Indexer** is an advanced blockchain indexing solution designed to track multiple events related to block header requests and their lifecycle. It processes logs from EVM-compatible blockchains, organizes and merges event data, and ensures consistency across daily snapshots.
-
----
-
-## Features
-
-### Multi-Chain Compatibility
-
-Easily configured to work with any EVM-compatible chain. Just provide the network details, and the indexer adapts to handle its logs.
-
-### Event Tracking
-
-The indexer tracks four key events from the contract:
-
-1. **BlockHeaderRequested**  
-   Emitted when a block header request is created.
-
-   **Fields:**
-
-   - `contractAddress`: The address of the contract making the request.
-   - `blockNumber`: The requested block number.
-   - `headerIndex`: The index of the requested header field.
-   - `feeAmount`: The fee offered for fulfilling the request (in wei).
-
-2. **BlockHeaderResponded**  
-   Emitted when a block header request is successfully fulfilled.
-
-   **Fields:**
-
-   - `responder`: The address that responded with the requested header.
-   - `blockNumber`: The block number that was fulfilled.
-   - `headerIndex`: The index of the fulfilled header field.
-
-3. **BlockHeaderCommitted**  
-   Emitted when a block hash is successfully committed.
-
-   **Fields:**
-
-   - `blockNumber`: The block number for which the blockhash was committed.
-
-4. **BlockHeaderRefunded**  
-   Emitted when a refund is processed for a request that cannot be completed.
-
-   **Fields:**
-
-   - `blockNumber`: The block number of the refunded request.
-   - `headerIndex`: The header index of the refunded request.
-
-### Merging and Deduplication
-
-All events are merged into a single, consistent JSON structure. The merge process ensures:
-
-- **Requested & Responded**: Requests are matched with responses if they share the same `blockNumber` and `headerIndex`.
-- **Committed Events**: If a commit occurs for a given `blockNumber`, all related requests/responses for that `blockNumber` are updated to reflect the commit. If no related requests exist, a separate commit-only record is created.
-- **Refunded Events**: For a refunded `blockNumber` and `headerIndex`, the corresponding request/response record is updated to include refund details. If no matching request/response record exists, a new refund-only record is created.
-
-### Consistent Data Storage
-
-- **Network-Specific Folders**: Each network has its own directory.
-- **Daily Files**: Events are stored in daily files named `YYYY-MM-DD.json`.
-- **Block Range Files**: `block_ranges.json` records the start and end blocks indexed for each day.
-- **Global Tracker**: `last_blocks.json` maintains the last processed block for each network.
-
-### Handling Block Ranges
-
-The indexer respects RPC limitations by splitting large block ranges into smaller chunks, ensuring compatibility with various RPC providers.
-
-### Detailed Logging
-
-- Chains being processed.
-- Block ranges fetched.
-- Number of logs fetched per event type.
-- Updated daily event files and trackers.
+<div style="text-align:center" align="center">
+    <img src="https://raw.githubusercontent.com/headerprotocol/headerprotocol/master/logo.png" width="200">
+</div>
 
 ---
+
+This indexer processes and merges multiple event types from EVM-compatible blockchains into structured JSON files. Events tracked:
+
+- **BlockHeaderRequested(blockNumber+headerIndex)**: A request for a block header.
+- **BlockHeaderResponded(blockNumber+headerIndex)**: A response to a previous request.
+- **BlockHeaderCommitted(blockNumber)**: Indicates a block header has been fully committed.
+- **BlockHeaderRefunded(blockNumber+headerIndex)**: A refund event for requests that cannot be completed.
+
+## Key Features
+
+1. **Single Query for All Events**: Combines multiple event ABIs into a single `getLogs` call for efficiency.
+2. **Robust Event Merging**:
+   - Requests, Responses, and Refunds are keyed by `(blockNumber + headerIndex)`.
+   - Committed events are keyed by `(blockNumber)`.
+     This prevents duplicates and creates a unified record for each request cycle.
+3. **Daily & Monthly Files**:
+   - Stores events in daily JSON files named `YYYY-MM-DD.json`.
+   - After each run, merges all daily files for the month into a `YYYY-MM.json` file.
+   - If any daily file updates, the monthly file is rebuilt to ensure consistency.
+4. **Block Range Tracking**:
+   - Keeps track of the last processed block for each network.
+   - Manages block range queries in chunks (max 800 blocks) to avoid RPC limitations.
+5. **Data Consistency**:
+   - All block numbers, indexes, and event fields are consistently stored as strings.
+   - Timestamps `createdAt` and `updatedAt` are recorded.
+6. **Scalability & Transparency**:
+   - Detailed logging.
+   - Works with any EVM-compatible network.
+
+## File Structure
+
+```
+data/
+├── ethereum/
+│   ├── 2024-12-10.json       # Daily events
+│   ├── 2024-12.json          # Monthly aggregated file for December 2024
+│   ├── block_ranges.json     # Tracks daily block ranges
+├── polygon/
+│   ├── 2024-12-10.json
+│   ├── 2024-12.json
+│   ├── block_ranges.json
+├── last_blocks.json          # Tracks the last processed block for each network
+```
 
 ## Data Structure
 
-Each event object in the daily JSON file contains the following fields:
+Each event entry in the daily and monthly JSON looks like:
 
 ```json
 {
   "chainId": "1",
   "contractAddress": "0x...",
   "responder": "0x...",
-  "blockNumber": "123456",
-  "headerIndex": "1",
+  "blockNumber": "21369000",
+  "headerIndex": "5",
   "feeAmount": "1000000000",
 
-  "requestedBlockNumber": "123450",
+  "requestedBlockNumber": "21369000",
   "requestedTransactionHash": "0x...",
   "requestedBlockHash": "0x...",
 
-  "respondedBlockNumber": "123460",
+  "respondedBlockNumber": "21369010",
   "respondedTransactionHash": "0x...",
   "respondedBlockHash": "0x...",
 
-  "committedBlockNumber": "123470",
+  "committedBlockNumber": "21369020",
   "committedTransactionHash": "0x...",
   "committedBlockHash": "0x...",
 
-  "refundedBlockNumber": "123480",
+  "refundedBlockNumber": "21369030",
   "refundedTransactionHash": "0x...",
   "refundedBlockHash": "0x...",
 
@@ -110,71 +83,22 @@ Each event object in the daily JSON file contains the following fields:
 }
 ```
 
-**Notes:**
+Not all fields are always present. For example, if no refund occurred for a request, `refundedBlockNumber` and related fields remain `null`.
 
-- `blockNumber` and `headerIndex` refer to the requested/resolved/refunded data fields.
-- `requestedBlockNumber`, `respondedBlockNumber`, `committedBlockNumber`, and `refundedBlockNumber` refer to the actual blockchain block number in which the event was recorded.
-- Transaction and block hashes (`requestedTransactionHash`, `respondedTransactionHash`, `committedTransactionHash`, `refundedTransactionHash`, etc.) correspond to the events themselves.
+## How it Works
 
-### Block Range Files (`block_ranges.json`)
+1. **Initialization**: Reads `last_blocks.json` and `block_ranges.json` to determine where to start.
+2. **Fetching Events**:
+   - Uses `viem`'s `getLogs` with multiple ABIs.
+   - Decodes logs into structured `args` automatically.
+3. **Merging Events**:
+   - Calls `mergeEvents` to unify data into daily files.
+   - Creates or updates monthly files after every daily run.
+4. **Updating Trackers**:
+   - Updates `block_ranges.json` and `last_blocks.json` accordingly.
 
-Tracks the daily block ranges processed:
+## Benefits
 
-```json
-{
-  "2024-12-10": {
-    "startBlock": "21368974",
-    "endBlock": "21369974"
-  }
-}
-```
-
-### Global Block Tracker (`last_blocks.json`)
-
-Tracks the last processed block for each network:
-
-```json
-{
-  "ethereum": {
-    "fromBlock": "21369975"
-  },
-  "polygon": {
-    "fromBlock": "65294773"
-  }
-}
-```
-
----
-
-## Improvements and Benefits
-
-### Holistic Event View
-
-Combining requested, responded, committed, and refunded events into a single record (when applicable) provides a comprehensive view of the request lifecycle.
-
-### Block-Level Consistency
-
-Committed events, which apply to all requests at a given blockNumber, ensure data completeness by updating multiple records simultaneously.
-
-### Flexible Data Structure
-
-The indexer gracefully handles cases where events (like commits or refunds) occur independently of requests or responses, creating standalone entries where necessary.
-
-### Easy Analysis
-
-Storing all data points in a uniform JSON structure facilitates analysis, debugging, and integration with downstream applications.
-
----
-
-## Directory Structure
-
-```
-data/
-├── ethereum/
-│   ├── 2024-12-10.json       # Daily events with requested/responded/committed/refunded data
-│   ├── block_ranges.json     # Daily block range tracker
-├── polygon/
-│   ├── 2024-12-10.json
-│   ├── block_ranges.json
-├── last_blocks.json          # Global tracker for last processed blocks
-```
+- Offers a complete view of requests, responses, commits, and refunds in a single dataset.
+- Enables straightforward analysis, charting, and reporting.
+- Scales with blockchain growth and handles large block ranges efficiently.
