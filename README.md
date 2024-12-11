@@ -60,7 +60,7 @@ Each event entry in the daily and monthly JSON looks like:
   "responder": "0x...",
   "blockNumber": "21369000",
   "headerIndex": "5",
-  "feeAmount": "1000000000",
+  "rewardAmount": "1000000000",
 
   "requestedBlockNumber": "21369000",
   "requestedTransactionHash": "0x...",
