@@ -1,8 +1,8 @@
 {
   "ethereum": {
-    "fromBlock": "21393283"
+    "fromBlock": "21393350"
   },
   "polygon": {
-    "fromBlock": "65430348"
+    "fromBlock": "65430720"
   }
 }
