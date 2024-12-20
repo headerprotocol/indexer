@@ -47,33 +47,10 @@ const ABI = parseAbi([
 ]);
 
 const DATA_DIR = "./data";
-const MAX_BLOCK_RANGE = 800; // Maximum block range allowed per request
+const MAX_BLOCK_RANGE = 800;
 
-// Helper Functions
 const ensureDirExists = (dir) => {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-};
-
-const stringifyWithBigInt = (data) =>
-  JSON.stringify(
-    data,
-    (_, value) => (typeof value === "bigint" ? value.toString() : value),
-    2
-  );
-
-const parseWithBigInt = (data) =>
-  JSON.parse(data, (_, value) => (/^\d+$/.test(value) ? BigInt(value) : value));
-
-const saveTrackerFile = (filepath, data) => {
-  fs.writeFileSync(filepath, stringifyWithBigInt(data));
-};
-
-const loadTrackerFile = (filepath) => {
-  try {
-    return parseWithBigInt(fs.readFileSync(filepath, "utf8"));
-  } catch {
-    return {};
-  }
 };
 
 const loadJsonFile = (filepath) => {
@@ -81,6 +58,14 @@ const loadJsonFile = (filepath) => {
     return JSON.parse(fs.readFileSync(filepath, "utf8"));
   } catch {
     return [];
+  }
+};
+
+const loadJsonObject = (filepath) => {
+  try {
+    return JSON.parse(fs.readFileSync(filepath, "utf8"));
+  } catch {
+    return {};
   }
 };
 
@@ -93,17 +78,6 @@ const saveJsonFile = (filepath, data) => {
       2
     )
   );
-};
-
-const splitBlockRanges = (fromBlock, toBlock, maxRange) => {
-  const ranges = [];
-  let start = fromBlock;
-  while (start <= toBlock) {
-    const end = start + BigInt(maxRange) - 1n;
-    ranges.push({ fromBlock: start, toBlock: end > toBlock ? toBlock : end });
-    start = end + 1n;
-  }
-  return ranges;
 };
 
 const createRpcClient = (chain, rpcs) => {
@@ -135,13 +109,24 @@ const fetchWithRetries = async (
         console.log(`Rate limit hit. Switching to next RPC: ${newRpc}`);
         rpcManager.client = rpcManager.createClient(newRpc);
         await new Promise((resolve) => setTimeout(resolve, delay));
-        delay *= 2; // Exponential backoff
+        delay *= 2;
       } else {
         throw error;
       }
     }
   }
-  throw new Error("Exceeded maximum retries across all RPCs.");
+  throw new Error("Exceeded maximum retries.");
+};
+
+const splitBlockRanges = (fromBlock, toBlock, maxRange) => {
+  const ranges = [];
+  let start = fromBlock;
+  while (start <= toBlock) {
+    const end = start + BigInt(maxRange) - 1n;
+    ranges.push({ fromBlock: start, toBlock: end > toBlock ? toBlock : end });
+    start = end + 1n;
+  }
+  return ranges;
 };
 
 const fetchLogsInRange = async (
@@ -165,221 +150,182 @@ const fetchLogsInRange = async (
   return logs;
 };
 
-/**
- * Merge logic for daily events (raw logs into structured events):
- * - Key by "blockNumber-headerIndex" for requests/responses/refunds and "blockNumber-committed" for commit-only.
- * - If a commit-only entry is present and no other events share that blockNumber, keep it as commit-only.
- * - If another event for that blockNumber appears later, merge the commit fields in and remove the commit-only entry.
- */
-const mergeEvents = (existingData, newEvents) => {
-  const eventMap = new Map();
+// After updating entries in a block file, ensure commit logic:
+// If there's a commit-only entry and other entries exist, copy commit to all and remove commit-only entry.
+// If commit appears and other entries exist, ensure each has commit.
+const normalizeCommitLogic = (data) => {
+  const commitOnlyIndex = data.findIndex(
+    (d) => d.commit && !d.headerIndex && !d.request && !d.responses && !d.refund
+  );
+  const hasCommitOnly = commitOnlyIndex !== -1;
+  const commitOnlyEntry = hasCommitOnly ? data[commitOnlyIndex] : null;
 
-  // Load existing data
-  for (const evt of existingData) {
-    const key =
-      evt.headerIndex !== undefined
-        ? `${evt.blockNumber}-${evt.headerIndex}`
-        : `${evt.blockNumber}-committed`;
-    eventMap.set(key, evt);
-  }
+  // Count how many entries have events besides commit-only
+  const eventEntries = data.filter(
+    (d) => d.headerIndex !== undefined || d.request || d.responses || d.refund
+  );
 
-  const getKey = (ev) => {
-    if (ev.eventType === "committed") return `${ev.argsBlockNumber}-committed`;
-    if (ev.headerIndex !== undefined)
-      return `${ev.argsBlockNumber}-${ev.headerIndex}`;
-    return `${ev.argsBlockNumber}-committed`;
-  };
-
-  for (const event of newEvents) {
-    const key = getKey(event);
-    const existing = eventMap.get(key) || {};
-
-    if (!existing.responses) existing.responses = [];
-
-    existing.chainId = event.chainId;
-    existing.createdAt = existing.createdAt || event.createdAt;
-    existing.updatedAt = new Date().toISOString();
-    existing.blockNumber = event.argsBlockNumber;
-    if (event.headerIndex !== undefined)
-      existing.headerIndex = event.headerIndex;
-
-    switch (event.eventType) {
-      case "request":
-        existing.request = {
-          contractAddress: event.requestedContractAddress,
-          blockNumber: event.requestedEventBlockNumber,
-          transactionHash: event.requestedTransactionHash,
-          blockHash: event.requestedBlockHash,
-        };
-        break;
-
-      case "response":
-        if (
-          !existing.responses.some(
-            (r) => r.transactionHash === event.respondedTransactionHash
-          )
-        ) {
-          existing.responses.push({
-            contractAddress: event.responseContractAddress,
-            responder: event.responder,
-            blockNumber: event.respondedEventBlockNumber,
-            transactionHash: event.respondedTransactionHash,
-            blockHash: event.respondedBlockHash,
-          });
-        }
-        break;
-
-      case "committed":
-        existing.commit = {
-          blockNumber: event.committedEventBlockNumber,
-          transactionHash: event.committedTransactionHash,
-          blockHash: event.committedBlockHash,
-        };
-        break;
-
-      case "refunded":
-        existing.refund = {
-          blockNumber: event.refundedEventBlockNumber,
-          transactionHash: event.refundedTransactionHash,
-          blockHash: event.refundedBlockHash,
-        };
-        break;
+  if (hasCommitOnly && eventEntries.length > 0) {
+    // Move commit into all event entries
+    for (const evt of eventEntries) {
+      evt.commit = { ...commitOnlyEntry.commit };
+      evt.updatedAt = new Date().toISOString();
     }
-
-    eventMap.set(key, existing);
-  }
-
-  // Post-processing for daily merges: merge committed events if possible
-  const finalMap = new Map(eventMap);
-  for (const [key, value] of eventMap.entries()) {
-    if (key.endsWith("-committed") && value.commit) {
-      const blockNumber = key.replace("-committed", "");
-      let merged = false;
-      for (const [innerKey, innerValue] of eventMap.entries()) {
-        if (innerKey !== key && innerKey.startsWith(`${blockNumber}-`)) {
-          innerValue.commit = { ...value.commit };
-          innerValue.updatedAt = new Date().toISOString();
-          merged = true;
-        }
-      }
-      if (merged) {
-        finalMap.delete(key);
+    // Remove commit-only entry
+    data.splice(commitOnlyIndex, 1);
+  } else if (!hasCommitOnly && eventEntries.some((e) => e.commit)) {
+    // If commit arrives after other events are created,
+    // ensure that commit is present in all entries that lack it.
+    let commitData = null;
+    for (const evt of data) {
+      if (evt.commit) {
+        commitData = evt.commit;
+        break;
       }
     }
-  }
-
-  for (const val of finalMap.values()) {
-    if (val.responses && val.responses.length === 0) {
-      delete val.responses;
+    if (commitData) {
+      for (const evt of data) {
+        if (!evt.commit) {
+          evt.commit = { ...commitData };
+          evt.updatedAt = new Date().toISOString();
+        }
+      }
     }
   }
 
-  return Array.from(finalMap.values());
+  return data;
 };
 
-/**
- * Merge logic for monthly events:
- * Here, we are merging already structured daily events (not raw logs).
- * The structure is final, so we just need to unify any duplicates.
- * - Key events similarly by "blockNumber-headerIndex" or "blockNumber-committed".
- * - If the same event appears multiple times, merge fields:
- *   - Merge `request`, `commit`, `refund` if they don't exist.
- *   - Combine `responses` arrays without duplicates.
- * - Retain commit-only entries if no related events are found.
- */
-const mergeMonthlyEvents = (existingData, newData) => {
-  const eventMap = new Map();
-
-  const getMonthlyKey = (evt) => {
-    if (evt.headerIndex !== undefined)
-      return `${evt.blockNumber}-${evt.headerIndex}`;
-    return `${evt.blockNumber}-committed`;
-  };
-
-  const mergeResponseArrays = (arr1 = [], arr2 = []) => {
-    const seenTx = new Set(arr1.map((r) => r.transactionHash));
-    for (const resp of arr2) {
-      if (!seenTx.has(resp.transactionHash)) {
-        arr1.push(resp);
-      }
-    }
-    return arr1;
-  };
-
-  const mergeEventObjects = (target, source) => {
-    // Merge request
-    if (source.request && !target.request)
-      target.request = { ...source.request };
-    // Merge commit
-    if (source.commit && !target.commit) target.commit = { ...source.commit };
-    // Merge refund
-    if (source.refund && !target.refund) target.refund = { ...source.refund };
-    // Merge responses
-    if (source.responses) {
-      target.responses = mergeResponseArrays(
-        target.responses,
-        source.responses
+const updateBlockFile = (blockFilePath, eventObj) => {
+  let data = loadJsonFile(blockFilePath);
+  let entryIndex = -1;
+  if (eventObj.headerIndex !== undefined) {
+    entryIndex = data.findIndex((d) => d.headerIndex === eventObj.headerIndex);
+  } else {
+    // For commit-only or if no headerIndex, find commit-only entry
+    if (eventObj.eventType === "committed") {
+      // commit-only scenario
+      entryIndex = data.findIndex((d) => d.commit && !d.headerIndex);
+    } else {
+      // If no headerIndex for other events is unusual, but handled anyway
+      entryIndex = data.findIndex(
+        (d) =>
+          d.headerIndex === undefined && !d.request && !d.responses && !d.refund
       );
     }
-  };
-
-  // Insert existing events first
-  for (const evt of existingData) {
-    const key = getMonthlyKey(evt);
-    eventMap.set(key, { ...evt });
   }
 
-  // Merge new data
-  for (const evt of newData) {
-    const key = getMonthlyKey(evt);
-    if (!eventMap.has(key)) {
-      eventMap.set(key, { ...evt });
-    } else {
-      const existing = eventMap.get(key);
-      // Merge all relevant fields
-      mergeEventObjects(existing, evt);
+  let entry = entryIndex > -1 ? data[entryIndex] : null;
 
-      // Update timestamps
-      // Keep earliest createdAt, update updatedAt to now
-      if (new Date(evt.createdAt) < new Date(existing.createdAt)) {
-        existing.createdAt = evt.createdAt;
+  if (!entry) {
+    entry = {
+      chainId: eventObj.chainId,
+      blockNumber: eventObj.argsBlockNumber,
+      headerIndex: eventObj.headerIndex,
+      createdAt: eventObj.createdAt,
+      updatedAt: eventObj.updatedAt,
+    };
+    data.push(entry);
+    entryIndex = data.length - 1;
+  } else {
+    entry.updatedAt = new Date().toISOString();
+  }
+
+  switch (eventObj.eventType) {
+    case "request":
+      entry.request = {
+        rewardAmount: eventObj.requestedRewardAmount,
+        contractAddress: eventObj.requestedContractAddress,
+        blockNumber: eventObj.requestedEventBlockNumber,
+        transactionHash: eventObj.requestedTransactionHash,
+        blockHash: eventObj.requestedBlockHash,
+      };
+      break;
+
+    case "response":
+      if (!entry.responses) entry.responses = [];
+      if (
+        !entry.responses.some(
+          (r) => r.transactionHash === eventObj.respondedTransactionHash
+        )
+      ) {
+        entry.responses.push({
+          contractAddress: eventObj.responseContractAddress,
+          responder: eventObj.responder,
+          blockNumber: eventObj.respondedEventBlockNumber,
+          transactionHash: eventObj.respondedTransactionHash,
+          blockHash: eventObj.respondedBlockHash,
+        });
       }
-      existing.updatedAt = new Date().toISOString();
-    }
+      break;
+
+    case "committed":
+      entry.commit = {
+        blockNumber: eventObj.committedEventBlockNumber,
+        transactionHash: eventObj.committedTransactionHash,
+        blockHash: eventObj.committedBlockHash,
+      };
+      break;
+
+    case "refunded":
+      entry.refund = {
+        blockNumber: eventObj.refundedEventBlockNumber,
+        transactionHash: eventObj.refundedTransactionHash,
+        blockHash: eventObj.refundedBlockHash,
+      };
+      break;
   }
 
-  return Array.from(eventMap.values());
+  data[entryIndex] = entry;
+  data = normalizeCommitLogic(data);
+  saveJsonFile(blockFilePath, data);
 };
 
-// Rebuild monthly file using `mergeMonthlyEvents`
-const rebuildMonthlyFile = (networkDir, yearMonth) => {
+const rebuildDailyIndex = (dayDir) => {
   const files = fs
-    .readdirSync(networkDir)
-    .filter(
-      (f) =>
-        f.startsWith(yearMonth) &&
-        f.endsWith(".json") &&
-        f.match(/^\d{4}-\d{2}-\d{2}\.json$/)
-    );
-
+    .readdirSync(dayDir)
+    .filter((f) => f.endsWith(".json") && f !== "index.json");
   let allEvents = [];
   for (const file of files) {
-    const dailyData = loadJsonFile(path.join(networkDir, file));
-    // Monthly merge deals with fully structured daily data
-    allEvents = mergeMonthlyEvents(allEvents, dailyData);
+    const eventData = loadJsonFile(path.join(dayDir, file));
+    allEvents = allEvents.concat(eventData);
   }
+  saveJsonFile(path.join(dayDir, "index.json"), allEvents);
+};
 
-  const monthlyFilePath = path.join(networkDir, `${yearMonth}.json`);
-  saveJsonFile(monthlyFilePath, allEvents);
-  console.log(
-    `Rebuilt monthly file: ${yearMonth}.json with ${allEvents.length} events`
-  );
+const rebuildMonthlyIndex = (monthDir) => {
+  const days = fs.readdirSync(monthDir).filter((d) => /^\d{2}$/.test(d));
+  let allEvents = [];
+  for (const day of days) {
+    const dayIndexPath = path.join(monthDir, day, "index.json");
+    if (fs.existsSync(dayIndexPath)) {
+      const dayEvents = loadJsonFile(dayIndexPath);
+      allEvents = allEvents.concat(dayEvents);
+    }
+  }
+  saveJsonFile(path.join(monthDir, "index.json"), allEvents);
+};
+
+const rebuildYearlyIndex = (yearDir) => {
+  const months = fs.readdirSync(yearDir).filter((m) => /^\d{2}$/.test(m));
+  let allEvents = [];
+  for (const month of months) {
+    const monthIndexPath = path.join(yearDir, month, "index.json");
+    if (fs.existsSync(monthIndexPath)) {
+      const monthEvents = loadJsonFile(monthIndexPath);
+      allEvents = allEvents.concat(monthEvents);
+    }
+  }
+  saveJsonFile(path.join(yearDir, "index.json"), allEvents);
 };
 
 (async () => {
   const now = new Date();
   const today = now.toISOString().split("T")[0];
-  const thisYearMonth = today.slice(0, 7); // YYYY-MM
+  const [year, month, day] = today.split("/")[0].includes("-")
+    ? today.split("-")
+    : today.split("/");
+  const datePath = `${year}/${month}/${day}`;
 
   for (const {
     name,
@@ -397,11 +343,22 @@ const rebuildMonthlyFile = (networkDir, yearMonth) => {
     const networkDir = path.join(DATA_DIR, name);
     ensureDirExists(networkDir);
 
-    const blockRangesFile = path.join(networkDir, "block_ranges.json");
-    const lastBlocksFile = path.join(DATA_DIR, "last_blocks.json");
+    const mapFile = path.join(networkDir, "map.json");
+    let mapData = loadJsonObject(mapFile);
 
-    const lastBlocks = loadTrackerFile(lastBlocksFile);
-    const blockRanges = loadTrackerFile(blockRangesFile);
+    const historyFile = path.join(networkDir, "history.json");
+    let historyData = loadJsonObject(historyFile);
+    if (!historyData.updates) {
+      historyData.updates = [];
+    }
+
+    const lastBlocksFile = path.join(DATA_DIR, "last_blocks.json");
+    let lastBlocks = {};
+    try {
+      lastBlocks = JSON.parse(fs.readFileSync(lastBlocksFile, "utf8"));
+    } catch {
+      lastBlocks = {};
+    }
 
     const fromBlock = BigInt(lastBlocks[name]?.fromBlock || defaultFromBlock);
     const latestBlock = await fetchWithRetries(
@@ -436,6 +393,7 @@ const rebuildMonthlyFile = (networkDir, yearMonth) => {
               eventType: "request",
               argsBlockNumber: args.blockNumber.toString(),
               headerIndex: args.headerIndex.toString(),
+              requestedRewardAmount: args.rewardAmount.toString(),
               requestedContractAddress: args.contractAddress,
               requestedEventBlockNumber: log.blockNumber.toString(),
               requestedTransactionHash: log.transactionHash,
@@ -482,33 +440,67 @@ const rebuildMonthlyFile = (networkDir, yearMonth) => {
       })
       .filter(Boolean);
 
-    // Merge with existing daily file
-    const dailyFile = path.join(networkDir, `${today}.json`);
-    const dailyData = loadJsonFile(dailyFile);
-    const mergedData = mergeEvents(dailyData, categorizedEvents);
-
-    console.log(`Saving ${mergedData.length} events to ${dailyFile}`);
-    saveJsonFile(dailyFile, mergedData);
-
-    // Update block range tracker
-    if (!blockRanges[today]) {
-      blockRanges[today] = {
-        startBlock: fromBlock.toString(),
-        endBlock: toBlock.toString(),
-      };
-    } else {
-      blockRanges[today].endBlock = toBlock.toString();
+    if (categorizedEvents.length === 0) {
+      console.log("No new events.");
+      lastBlocks[name] = { fromBlock: (toBlock + 1n).toString() };
+      fs.writeFileSync(lastBlocksFile, JSON.stringify(lastBlocks, null, 2));
+      continue;
     }
 
-    console.log(`Updating block ranges: ${fromBlock} - ${toBlock}`);
-    saveTrackerFile(blockRangesFile, blockRanges);
+    // Ensure directories for year/month/day
+    const yearDir = path.join(networkDir, year);
+    const monthDir = path.join(yearDir, month);
+    const dayDir = path.join(monthDir, day);
+    ensureDirExists(yearDir);
+    ensureDirExists(monthDir);
+    ensureDirExists(dayDir);
 
+    const updatedBlockNumbers = new Set();
+
+    // Process each event
+    for (const eventObj of categorizedEvents) {
+      const argsBlockNumber = eventObj.argsBlockNumber;
+
+      // Check map for existing entry
+      let mappedDate = mapData[argsBlockNumber];
+      if (!mappedDate) {
+        // New block number, map it to today's date
+        const datePathLocal = `${year}/${month}/${day}`;
+        mapData[argsBlockNumber] = datePathLocal;
+        mappedDate = datePathLocal;
+      }
+
+      const [y, mm, dd] = mappedDate.split("/");
+      const blockDir = path.join(networkDir, y, mm, dd);
+      ensureDirExists(blockDir);
+
+      const blockFile = path.join(blockDir, `${argsBlockNumber}.json`);
+      if (!fs.existsSync(blockFile)) {
+        saveJsonFile(blockFile, []);
+      }
+
+      updateBlockFile(blockFile, eventObj);
+      updatedBlockNumbers.add(argsBlockNumber);
+    }
+
+    // Update map.json
+    saveJsonFile(mapFile, mapData);
+
+    // Update history.json: append a new update record
+    historyData.updates.push({
+      timestamp: new Date().toISOString(),
+      updatedBlockNumbers: [...updatedBlockNumbers],
+    });
+    saveJsonFile(historyFile, historyData);
+
+    // Update last processed block
     lastBlocks[name] = { fromBlock: (toBlock + 1n).toString() };
-    console.log(`Updating last processed block to ${toBlock + 1n}`);
-    saveTrackerFile(lastBlocksFile, lastBlocks);
+    fs.writeFileSync(lastBlocksFile, JSON.stringify(lastBlocks, null, 2));
 
-    // Rebuild monthly file using the separate monthly merge
-    rebuildMonthlyFile(networkDir, thisYearMonth);
+    // Rebuild indexes
+    rebuildDailyIndex(dayDir);
+    rebuildMonthlyIndex(monthDir);
+    rebuildYearlyIndex(yearDir);
 
     console.log(`Finished processing chain: ${name}`);
   }
