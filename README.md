@@ -6,99 +6,228 @@
 
 ---
 
-This indexer processes and merges multiple event types from EVM-compatible blockchains into structured JSON files. Events tracked:
+**Table of Contents**
 
-- **BlockHeaderRequested(blockNumber+headerIndex)**: A request for a block header.
-- **BlockHeaderResponded(blockNumber+headerIndex)**: A response to a previous request.
-- **BlockHeaderCommitted(blockNumber)**: Indicates a block header has been fully committed.
-- **BlockHeaderRefunded(blockNumber+headerIndex)**: A refund event for requests that cannot be completed.
+- [Overview](#overview)
+- [Events Processed](#events-processed)
+- [Data Structure](#data-structure)
+- [Workflow](#workflow)
+- [File Layout](#file-layout)
+- [Key Features](#key-features)
+- [Configuration](#configuration)
+- [Running the Indexer](#running-the-indexer)
 
-## Key Features
+---
 
-1. **Single Query for All Events**: Combines multiple event ABIs into a single `getLogs` call for efficiency.
-2. **Robust Event Merging**:
-   - Requests, Responses, and Refunds are keyed by `(blockNumber + headerIndex)`.
-   - Committed events are keyed by `(blockNumber)`.
-     This prevents duplicates and creates a unified record for each request cycle.
-3. **Daily & Monthly Files**:
-   - Stores events in daily JSON files named `YYYY-MM-DD.json`.
-   - After each run, merges all daily files for the month into a `YYYY-MM.json` file.
-   - If any daily file updates, the monthly file is rebuilt to ensure consistency.
-4. **Block Range Tracking**:
-   - Keeps track of the last processed block for each network.
-   - Manages block range queries in chunks (max 800 blocks) to avoid RPC limitations.
-5. **Data Consistency**:
-   - All block numbers, indexes, and event fields are consistently stored as strings.
-   - Timestamps `createdAt` and `updatedAt` are recorded.
-6. **Scalability & Transparency**:
-   - Detailed logging.
-   - Works with any EVM-compatible network.
+## Overview
 
-## File Structure
+The HeaderProtocol Event Indexer is a Node.js service that continuously fetches, decodes, and aggregates blockchain events from EVM-compatible networks. It normalizes various event types related to block headers (requests, responses, commits, refunds) into a structured JSON format.
 
-```
-data/
-├── ethereum/
-│   ├── 2024-12-10.json       # Daily events
-│   ├── 2024-12.json          # Monthly aggregated file for December 2024
-│   ├── block_ranges.json     # Tracks daily block ranges
-├── polygon/
-│   ├── 2024-12-10.json
-│   ├── 2024-12.json
-│   ├── block_ranges.json
-├── last_blocks.json          # Tracks the last processed block for each network
-```
+This service supports daily and monthly data aggregation, ensuring that you always have a coherent snapshot of on-chain activity.
+
+---
+
+## Events Processed
+
+The indexer fetches and merges the following events:
+
+- **BlockHeaderRequested (blockNumber + headerIndex)**:  
+  A request for a specific block header.
+- **BlockHeaderResponded (blockNumber + headerIndex)**:  
+  A response to a previously requested header.
+- **BlockHeaderCommitted (blockNumber)**:  
+  Indicates that the requested block header data is fully committed.
+- **BlockHeaderRefunded (blockNumber + headerIndex)**:  
+  A refund event for incomplete or invalid requests.
+
+These events are combined into a single, unified data structure per `(blockNumber, headerIndex)` pair, with `BlockHeaderCommitted` events keyed by `blockNumber` only.
+
+---
 
 ## Data Structure
 
-Each event entry in the daily and monthly JSON looks like:
+**Top-level keys:**
+
+- `blockNumber`: String representing the requested block number.
+- `headerIndex`: String representing the header index within the requested block.
+- `request`: Contains details of the request event:
+  ```json
+  "request": {
+    "contractAddress": "...",
+    "blockNumber": "...",
+    "transactionHash": "...",
+    "blockHash": "..."
+  }
+  ```
+- `responses`: An array of objects representing responses:
+  ```json
+  "responses": [
+    {
+      "contractAddress": "...",
+      "responder": "...",
+      "blockNumber": "...",
+      "transactionHash": "...",
+      "blockHash": "..."
+    }
+  ]
+  ```
+- `commit`: Contains details of the commit event:
+  ```json
+  "commit": {
+    "blockNumber": "...",
+    "transactionHash": "...",
+    "blockHash": "..."
+  }
+  ```
+- `refund`: Contains details of the refund event:
+  ```json
+  "refund": {
+    "blockNumber": "...",
+    "transactionHash": "...",
+    "blockHash": "..."
+  }
+  ```
+
+**Metadata Fields:**
+
+- `chainId`: String representing the blockchain's chain ID.
+- `createdAt`, `updatedAt`: ISO timestamps indicating when the record was created and last updated.
+
+**Example of a fully populated record:**
 
 ```json
 {
-  "chainId": "1",
-  "contractAddress": "0x...",
-  "responder": "0x...",
-  "blockNumber": "21369000",
-  "headerIndex": "5",
-  "rewardAmount": "1000000000",
-
-  "requestedBlockNumber": "21369000",
-  "requestedTransactionHash": "0x...",
-  "requestedBlockHash": "0x...",
-
-  "respondedBlockNumber": "21369010",
-  "respondedTransactionHash": "0x...",
-  "respondedBlockHash": "0x...",
-
-  "committedBlockNumber": "21369020",
-  "committedTransactionHash": "0x...",
-  "committedBlockHash": "0x...",
-
-  "refundedBlockNumber": "21369030",
-  "refundedTransactionHash": "0x...",
-  "refundedBlockHash": "0x...",
-
-  "createdAt": "2024-12-10T12:00:00Z",
-  "updatedAt": "2024-12-10T12:05:00Z"
+  "chainId": "31337",
+  "blockNumber": "1000",
+  "headerIndex": "15",
+  "request": {
+    "contractAddress": "0x5FbDB2315678afecb367...",
+    "blockNumber": "500",
+    "transactionHash": "0xd578aca20714567281b7d...",
+    "blockHash": "0x8aad50287ac6ff773ccd5..."
+  },
+  "responses": [
+    {
+      "contractAddress": "0xe7f1725E7734CE288F83...",
+      "responder": "0xf39Fd6e51aad88F6F4ce6a...",
+      "blockNumber": "501",
+      "transactionHash": "0x9d3b3ff38e5434e4d98f2a...",
+      "blockHash": "0x27298713dc3523d93bcddd..."
+    }
+  ],
+  "commit": {
+    "blockNumber": "502",
+    "transactionHash": "0xc39d36a7cb300658b1c0bd9dc9...",
+    "blockHash": "0xbcbb234c25ff71e986d3dd..."
+  },
+  "refund": {
+    "blockNumber": "503",
+    "transactionHash": "0xf2a2b98639f41f9e06d5...",
+    "blockHash": "0xc6e904d8cfd5648108d0041..."
+  },
+  "createdAt": "2024-12-20T12:00:00Z",
+  "updatedAt": "2024-12-20T12:10:00Z"
 }
 ```
 
-Not all fields are always present. For example, if no refund occurred for a request, `refundedBlockNumber` and related fields remain `null`.
+Not all sections are always present. For example, if no responses were made, `responses` is omitted. If the header was never refunded, `refund` remains absent.
 
-## How it Works
+---
 
-1. **Initialization**: Reads `last_blocks.json` and `block_ranges.json` to determine where to start.
-2. **Fetching Events**:
-   - Uses `viem`'s `getLogs` with multiple ABIs.
-   - Decodes logs into structured `args` automatically.
-3. **Merging Events**:
-   - Calls `mergeEvents` to unify data into daily files.
-   - Creates or updates monthly files after every daily run.
-4. **Updating Trackers**:
-   - Updates `block_ranges.json` and `last_blocks.json` accordingly.
+## Workflow
 
-## Benefits
+1. **Initialization**:  
+   Reads `last_blocks.json` to determine the last processed block for each network and `block_ranges.json` for daily ranges.
 
-- Offers a complete view of requests, responses, commits, and refunds in a single dataset.
-- Enables straightforward analysis, charting, and reporting.
-- Scales with blockchain growth and handles large block ranges efficiently.
+2. **Fetching Events**:  
+   Uses `viem` to decode and fetch events in efficient block ranges.
+
+3. **Daily Aggregation**:
+
+   - Raw events are categorized and merged using `mergeEvents`.
+   - Writes out `YYYY-MM-DD.json` files, each representing a day's worth of activity.
+
+4. **Monthly Aggregation**:
+
+   - After updating daily files, the indexer merges all daily files for the month using `mergeMonthlyEvents`.
+   - Produces a `YYYY-MM.json` file that aggregates all daily data into a single snapshot for that month.
+
+5. **Update Tracking**:
+   - `last_blocks.json` and `block_ranges.json` updated to reflect new progress.
+   - Next run starts from the last processed block.
+
+---
+
+## File Layout
+
+```
+data/
+└── <network-name>/
+    ├── 2024-12-20.json          # Daily events for Dec 20, 2024
+    ├── 2024-12-21.json          # Daily events for Dec 21, 2024
+    ├── 2024-12.json             # Monthly aggregated file for Dec 2024
+    ├── block_ranges.json        # Tracks the block ranges processed each day
+last_blocks.json                 # Tracks the last processed block for each network
+```
+
+---
+
+## Key Features
+
+- **Single Query for All Events**:  
+  Aggregates multiple events via a single `getLogs` call to reduce overhead.
+
+- **Robust Merging Logic**:
+
+  - Daily merges convert raw logs into structured events.
+  - Monthly merges unify multiple daily files into a comprehensive monthly dataset.
+
+- **Commit-Only Event Support**:  
+  Standalone commit events remain even if no related request/response/refund events exist yet. Once such events appear, commit data merges seamlessly.
+
+- **Data Consistency & Scalability**:
+  - Handles large block ranges by splitting queries.
+  - Ensures consistent JSON structure suitable for analysis or indexing.
+
+---
+
+## Configuration
+
+- `NETWORKS`: An array of configured chains, each specifying `name`, `chainId`, `address`, RPC endpoints, and the `fromBlock` to start indexing.
+
+- `MAX_BLOCK_RANGE`: Maximum block chunk size to prevent RPC overload.
+
+- `DATA_DIR`: The base directory for storing JSON files.
+
+---
+
+## Running the Indexer
+
+1. **Install Dependencies**:
+
+   ```bash
+   npm install
+   ```
+
+2. **Run Anvil**:
+
+   ```bash
+   anvil
+   ```
+
+3. **Deploy** [headerprotocol](https://github.com/headerprotocol/headerprotocol):
+
+   ```bash
+   sudo bash ./script/anvil_events.sh
+   ```
+
+4. **Run the Indexer**:
+
+   ```bash
+   node src/indexer.js
+   ```
+
+   The indexer fetches new events, merges them into daily files, and reconstructs the monthly file.
+
+5. **Check Outputs**:  
+   Inspect `data/<network>/YYYY-MM-DD.json` and `data/<network>/YYYY-MM.json`.
