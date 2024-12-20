@@ -18,13 +18,13 @@
 
 ---
 
-## 📖 **Overview**
+## **Overview**
 
 The HeaderProtocol Event Indexer listens to blockchain events for requested block headers, responses, commits, and refunds. It efficiently organizes this data, enabling 🔎 **fast lookups** and 🛠 **incremental updates**, even when new events arrive long after the initial request.
 
 ---
 
-## ✨ **Key Features**
+## **Key Features**
 
 1. 🗃 **Granular Storage**  
    Each `argsBlockNumber` is stored in its **own file**, making lookups and updates lightning-fast 🚀.
@@ -45,7 +45,7 @@ The HeaderProtocol Event Indexer listens to blockchain events for requested bloc
 
 ---
 
-## 📂 **Directory Structure**
+## **Directory Structure**
 
 ```
 📂 data/<network>/
@@ -62,7 +62,7 @@ The HeaderProtocol Event Indexer listens to blockchain events for requested bloc
 
 ---
 
-## 🗂 **Data Structure**
+## **Data Structure**
 
 Example `[blockNumber].json`:
 
@@ -83,7 +83,7 @@ Example `[blockNumber].json`:
 
 ---
 
-## ⚡️ **Usage in a Client Interface**
+## **Usage in a Client Interface**
 
 ### Quick Lookup 🚀
 
@@ -129,7 +129,7 @@ Example `[blockNumber].json`:
 
 ---
 
-## 📊 **Diagrams**
+## **Diagrams**
 
 ### Sequence Diagram: How the Indexer Works
 
