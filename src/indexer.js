@@ -1,10 +1,13 @@
 import fs from "fs";
 import path from "path";
 import { createPublicClient, http, parseAbi } from "viem";
+import { foundry, mainnet, polygon } from "viem/chains";
 
 const NETWORKS = [
   {
     name: "ethereum",
+    chain: mainnet,
+    address: "0x5FbDB2315678afecb367f032d93F642f64180aa3",
     rpcs: [
       "https://eth-mainnet.g.alchemy.com/v2/K4l0nBr5UE4e8Kkr9oETClKtKcW9DJYT",
       "https://cosmological-blissful-research.quiknode.pro/223e82a51a5bd046eb64dea56744b813038d2495",
@@ -14,10 +17,12 @@ const NETWORKS = [
       "https://ethereum-mainnet.core.chainstack.com/fe2d2bc46bdaf3716bcb64bd9351e01b",
     ],
     chainId: 1,
-    fromBlock: 21441366n,
+    fromBlock: 21476311n,
   },
   {
     name: "polygon",
+    chain: polygon,
+    address: "0x5FbDB2315678afecb367f032d93F642f64180aa3",
     rpcs: [
       "https://polygon-mainnet.g.alchemy.com/v2/sTJtjdOBExGkT4lWuS-wt5VduGCQsqwf",
       "https://snowy-polished-daylight.matic.quiknode.pro/466e77c6325e477c76712cb478e6cd09ce1cc7a2",
@@ -27,16 +32,16 @@ const NETWORKS = [
       "https://polygon-mainnet.core.chainstack.com/275d1e0ae21da1e6aa7a21e9962e4ca5",
     ],
     chainId: 137,
-    fromBlock: 65699241n,
+    fromBlock: 65891421n,
   },
-  // {
-  //   name: "anvil",
-  //   chain: foundry,
-  //   address: "0x5FbDB2315678afecb367f032d93F642f64180aa3",
-  //   rpcs: [undefined],
-  //   chainId: 31337,
-  //   fromBlock: 1n,
-  // },
+  {
+    name: "anvil",
+    chain: foundry,
+    address: "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+    rpcs: ["http://127.0.0.1:8545"],
+    chainId: 31337,
+    fromBlock: 0n,
+  },
 ];
 
 const ABI = parseAbi([
@@ -46,6 +51,7 @@ const ABI = parseAbi([
   "event BlockHeaderRefunded(uint256 indexed blockNumber, uint256 indexed headerIndex)",
 ]);
 
+// const DATA_DIR = "../dashboard/public/data";
 const DATA_DIR = "./data";
 const MAX_BLOCK_RANGE = 800;
 
@@ -78,6 +84,24 @@ const saveJsonFile = (filepath, data) => {
       2
     )
   );
+};
+
+const isRpcAccessible = async (rpcUrl) => {
+  try {
+    const response = await fetch(rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "web3_clientVersion",
+        params: [],
+        id: 1,
+      }),
+    });
+    return response.ok;
+  } catch (error) {
+    return false;
+  }
 };
 
 const createRpcClient = (chain, rpcs) => {
@@ -335,7 +359,12 @@ const rebuildYearlyIndex = (yearDir) => {
     chainId,
     fromBlock: defaultFromBlock,
   } of NETWORKS) {
-    console.log(`\n\n------------ Processing chain: ${name} ------------`);
+    console.log(`\n------------ Processing chain: ${name} ------------`);
+
+    if (name === "anvil" && (!rpcs[0] || !(await isRpcAccessible(rpcs[0])))) {
+      console.log(`Skipping chain: ${name}. RPC is not accessible.\n`);
+      continue;
+    }
 
     const rpcManager = createRpcClient(chain, rpcs);
     rpcManager.client = rpcManager.createClient(rpcManager.getNextRpc());
@@ -441,7 +470,7 @@ const rebuildYearlyIndex = (yearDir) => {
       .filter(Boolean);
 
     if (categorizedEvents.length === 0) {
-      console.log("No new events.");
+      console.log(`No new events.\n`);
       lastBlocks[name] = { fromBlock: (toBlock + 1n).toString() };
       fs.writeFileSync(lastBlocksFile, JSON.stringify(lastBlocks, null, 2));
       continue;
@@ -502,6 +531,6 @@ const rebuildYearlyIndex = (yearDir) => {
     rebuildMonthlyIndex(monthDir);
     rebuildYearlyIndex(yearDir);
 
-    console.log(`Finished processing chain: ${name}`);
+    console.log(`Finished processing chain: ${name}\n`);
   }
 })();
