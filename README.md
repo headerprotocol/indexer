@@ -109,19 +109,13 @@ Example `[blockNumber].json`:
    anvil
    ```
 
-3. **Deploy** [HeaderProtocol](https://github.com/headerprotocol/headerprotocol):
+3. **Deploy and Indexer** [HeaderProtocol](https://github.com/headerprotocol/headerprotocol):
 
    ```bash
-   sudo bash ./script/anvil_events.sh
+   sudo bash ./src/anvil.sh
    ```
 
-4. **Start the Indexer**:
-
-   ```bash
-   node src/indexer.js
-   ```
-
-5. **Verify Outputs**:
+4. **Verify Outputs**:
    - ✅ `map.json`: Lookup table.
    - ✅ `history.json`: Update logs.
    - ✅ `[blockNumber].json`: Event data.
