@@ -300,6 +300,13 @@ const updateBlockFile = (blockFilePath, eventObj) => {
       break;
   }
 
+  if (entry.request?.contractAddress) {
+    entry.completed =
+      entry.responses?.some(
+        (response) => response.contractAddress === entry.request.contractAddress
+      ) ?? false;
+  }
+
   data[entryIndex] = entry;
   data = normalizeCommitLogic(data);
   saveJsonFile(blockFilePath, data);
@@ -359,7 +366,9 @@ const rebuildYearlyIndex = (yearDir) => {
     chainId,
     fromBlock: defaultFromBlock,
   } of NETWORKS) {
-    console.log(`\n------------ Processing chain: ${name} ------------`);
+    console.log(
+      `\n------------ Processing chain: ${name} (${chainId}) ------------`
+    );
 
     if (name === "anvil" && (!rpcs[0] || !(await isRpcAccessible(rpcs[0])))) {
       console.log(`Skipping chain: ${name}. RPC is not accessible.\n`);
@@ -369,7 +378,7 @@ const rebuildYearlyIndex = (yearDir) => {
     const rpcManager = createRpcClient(chain, rpcs);
     rpcManager.client = rpcManager.createClient(rpcManager.getNextRpc());
 
-    const networkDir = path.join(DATA_DIR, name);
+    const networkDir = path.join(DATA_DIR, chainId.toString());
     ensureDirExists(networkDir);
 
     const mapFile = path.join(networkDir, "map.json");
@@ -389,7 +398,9 @@ const rebuildYearlyIndex = (yearDir) => {
       lastBlocks = {};
     }
 
-    const fromBlock = BigInt(lastBlocks[name]?.fromBlock || defaultFromBlock);
+    const fromBlock = BigInt(
+      lastBlocks[chainId]?.fromBlock || defaultFromBlock
+    );
     const latestBlock = await fetchWithRetries(
       () => rpcManager.client.getBlockNumber(),
       rpcManager
@@ -471,7 +482,7 @@ const rebuildYearlyIndex = (yearDir) => {
 
     if (categorizedEvents.length === 0) {
       console.log(`No new events.\n`);
-      lastBlocks[name] = { fromBlock: (toBlock + 1n).toString() };
+      lastBlocks[chainId] = { fromBlock: (toBlock + 1n).toString() };
       fs.writeFileSync(lastBlocksFile, JSON.stringify(lastBlocks, null, 2));
       continue;
     }
@@ -523,7 +534,7 @@ const rebuildYearlyIndex = (yearDir) => {
     saveJsonFile(historyFile, historyData);
 
     // Update last processed block
-    lastBlocks[name] = { fromBlock: (toBlock + 1n).toString() };
+    lastBlocks[chainId] = { fromBlock: (toBlock + 1n).toString() };
     fs.writeFileSync(lastBlocksFile, JSON.stringify(lastBlocks, null, 2));
 
     // Rebuild indexes
@@ -531,6 +542,6 @@ const rebuildYearlyIndex = (yearDir) => {
     rebuildMonthlyIndex(monthDir);
     rebuildYearlyIndex(yearDir);
 
-    console.log(`Finished processing chain: ${name}\n`);
+    console.log(`Finished processing chain: ${name} (${chainId})\n`);
   }
 })();
